@@ -1,0 +1,1859 @@
+---
+title: "Machine Learning Enhances Accuracy of Partial Mouth Diagnostics for Periodontitis: A Multi-Cohort Study"
+author: "Lucas Zhang"
+date: "2025-03-17"
+output: html_document
+---
+
+# Introduction
+
+Approximately half the US non-institutionalized population ≥30 years will suffer from periodontitis. Severe periodontitis is estimated to account for 5.3 million disability-adjusted life-years worldwide, corresponding to an average health loss of 97 years per 100,000 persons, which contributes significantly to the global burden of disease. An accurate measure for the assessment of periodontitis burden is crucial to assess population-level treatment needs, identify risk factors, evaluate its socioeconomic impact and ultimately improve public health policies for the prevention and management of periodontitis. Nonetheless, current gold standard full-mouth examinations (FMEs) are resource- and time-demanding. Therefore, despite the importance of periodontitis-systemic disease associations, periodontal measures are often excluded from large medical cohort studies due to funding and logistics limitations. 
+
+In this study, we aim to establish a machine-learning based partial-mouth examination method to facilitate periodontitis diagonosis. 
+
+# Methods and Materials
+
+We developed and tested our PME protocol within an epidemiological cohort, the Oral Infections, Glucose Intolerance, and Insulin Resistance Study (ORIGINS) (N=1,100). The protocol was further validated using data from a separate cohort, the 2009-2012 National Health and Nutrition Examination Surveys (NHANES) (N=7,090). Our approach employs a generative classifier based on Gibbs sampling, using periodontal examination data, including probing depths (PD) and clinical attachment levels (CAL) from six teeth. These six teeth were selected from a pool of 376,740 possible combinations, optimized through an evolutionary algorithm. The predictive performance of our model was assessed by comparing it with other machine learning-based PME protocols, as well as traditional PME methods, using both the optimized six-teeth combination and the conventional Ramfjord teeth. Our diagnostic protocol is freely available and accessible via a dedicated R Shiny App.
+
+## Setups
+
+### Creating Constant Values and Loading Required Packages
+
+```{r setup, include=FALSE}
+library(tidyverse)
+library(ranger)
+library(ROCR)
+library(glmnet)
+library(e1071)
+library(kableExtra)
+library(knitr)
+library(haven)
+library(Hmisc)
+library(ggtext)
+library(ggtree)
+library(ggrepel)
+# library(patchwork)
+library(cowplot)
+library(pROC)
+set.seed(seed= 1233455)
+
+prefix = "ohx"
+suffix = c(str_c("pc", c("d", "m", "s", "p", "l", "a"), sep = ""), 
+           str_c("la", c("d", "m", "s", "p", "l", "a"), sep = "")) # pcd, ..., lad, ...
+all_tooth <- sprintf("%02d", c(seq(2,15), seq(18,31))) # all teeth in NHANES
+Ramfjord <- c("03", "09", "12", "19", "25", "28")
+half_mouth <- c("02", "03", "04", "05", "06", "07", "08",
+                "18", "19", "20", "21", "22", "23", "24")
+
+n_NA_tooth_cal_thre <- 5
+upper_bound <- 6 # normalize the data within 0 ~ 6/6+ will be good for visualization
+# the 2012 CDC/AAP case definition requires the information of CAL ≥ 6 mm, PD ≥ 5 mm
+# the 2018 EFP/AAP case definition required the information of Buccal or oral CAL ≥ 3 
+#mm with PD > 3 at >= 2 teeth
+
+enable_origins <- FALSE
+```
+
+### Helper Functions
+
+#### Case Definition
+
+2018 EFP/AAP Case Definitions (Tonetti et al., 2018, J Clin Periodontol):
+
+*  A patient is a periodontitis case in the context of clinical care if:   
+    +  Interdental CAL is detectable at ≥2 non-adjacent teeth, or 
+    +  Buccal or oral CAL ≥3 mm with pocketing >3 mm is detectable at ≥2 teeth
+*  Periodontitis Stage Classification (The initial stage should be determined using CAL. by CAL at the site of greatest loss):
+    +  Stage I: 1-2 mm
+    +  Stage II: 3-4 mm
+    +  Stage III/IV: ≥5 mm
+*  Pseudo-code for 2018 EFP/AAP Case Definition
+    +  interdental CAL is detectable (for tooth "x"):
+        -  max_across_sites_at_one_tooth(DF_CAL, MF_CAL, DL_CAL, ML_CAL) >= 1 
+        -  comment: Any of CALs interdental site is detectable at tooth "x"
+    +  Interdental CAL is detectable at ≥2 non-adjacent teeth:
+        -  count_across_teeth(interdental CAL is detectable) >= 3 | 
+        (count_across_teeth(interdental CAL is detectable) == 2 & teeth are non-adjacent)
+        -  comment: if we have at least 3 teeth with detectable interdental CAL, at least two teeth of them have to be non-adjacent
+    +  Buccal/Oral CAL ≥ 3 mm with PPD > 3 mm at ≥2 teeth
+        -  count_across_teeth(B_CAL >= 3 & B_PD >= 4) >= 2
+    +  a periodontitis case: Interdental CAL is detectable at ≥2 non-adjacent teeth OR Buccal or oral CAL ≥3 mm with pocketing >3 mm is detectable at ≥2 teeth 
+        -  Interdental CAL is detectable at ≥2 non-adjacent teeth | Buccal/Oral CAL ≥ 3 mm with PPD > 3 mm at ≥2 teeth
+    +  moderate periodontitis cases:
+        -  a periodontitis case & max_across_teeth(max_across_sites(DF_CAL, MF_CAL, DL_CAL, ML_CAL))  == 3 or 4
+    +  severe periodontitis cases: 
+        -  a periodontitis case & max_across_teeth(max_across_sites(DF_CAL, MF_CAL, DL_CAL, ML_CAL)) >= 5
+
+2012 CDC/AAP Case Definition (Eke et al., 2012, J Periodontol):
+
+*  Case Definition:
+    +  Mild periodontitis: ≥2 interproximal sites with AL ≥3 mm, and ≥2 interproximal sites with PD ≥4 mm (not on same tooth) or one site with PD ≥5 mm
+    +  Moderate periodontitis: ≥2 interproximal sites with AL ≥4 mm (not on same tooth), or ≥2 interproximal sites with PD ≥5 mm (not on same tooth)
+    +  Severe periodontitis: ≥2 interproximal sites with AL ≥6 mm (not on same tooth) and ≥1 interproximal site with PD ≥5 mm
+    +  No periodontitis: No evidence of mild, moderate, or severe periodontitis
+*  Pseudo-code for 2012 CDC/AAP Case Definition
+    +  Mild periodontitis: ≥2 interproximal sites with AL ≥3 mm, and ≥2 interproximal sites with PD ≥4 mm (not on same tooth) or one site with PD ≥5 mm
+        -  (count_across_teeth(max_across_sites_at_one_tooth(DF_CAL, MF_CAL, DL_CAL, ML_CAL) >= 3) >= 2) &
+         ( (count_across_teeth(max_across_sites_at_one_tooth(DF_PD, MF_PD, DL_PD, ML_PD) >= 4) >= 2) |
+           (count_across_teeth(max_across_sites_at_one_tooth(DF_PD, MF_PD, DL_PD, ML_PD) >= 5) >= 1) )
+        -  comments: while the case definition requires "interproximal sites" to achieve a threshold, we still need to first consider at the tooth level because the definition requires the evidence coming from at least two teeth 
+    +  Moderate periodontitis: ≥2 interproximal sites with AL ≥4 mm (not on same tooth), or ≥2 interproximal sites with PD ≥5 mm (not on same tooth)
+        -  (count_across_teeth(max_across_sites_at_one_tooth(DF_CAL, MF_CAL, DL_CAL, ML_CAL) >= 4) >= 2) |
+           (count_across_teeth(max_across_sites_at_one_tooth(DF_PD, MF_PD, DL_PD, ML_PD) >= 5) >= 2)
+    +  Severe periodontitis: ≥2 interproximal sites with AL ≥6 mm (not on same tooth) and ≥1 interproximal site with PD ≥5 mm
+        -  (count_across_teeth(max_across_sites_at_one_tooth(DF_CAL, MF_CAL, DL_CAL, ML_CAL) >=6 ) >= 2) &
+           (count_across_teeth(max_across_sites_at_one_tooth(DF_PD, MF_PD, DL_PD, ML_PD) >= 5 ) >= 1)
+
+```{r, file = '../src/case_def.R', eval=FALSE, echo=TRUE}
+```
+
+```{r, eval=TRUE, echo=FALSE}
+source('../src/case_def.R')
+```
+
+#### Other Functions
+
+```{r, file = '../src/calculate_metrics2.R', eval=FALSE, echo=TRUE}
+```
+
+```{r, eval=TRUE, echo=FALSE}
+source('../src/calculate_metrics2.R')
+```
+
+```{r, file = '../src/prediction_models.R', eval=FALSE, echo=TRUE}
+```
+
+```{r, eval=TRUE, echo=FALSE}
+source('../src/prediction_models.R')
+```
+
+```{r, file = '../src/paint_tooth.R', eval=FALSE, echo=TRUE}
+```
+
+```{r, eval=TRUE, echo=FALSE}
+source('../src/paint_tooth.R')
+```
+
+## Data Input
+
+### NHANES (2009-2014) Data Input
+
+Datasets:
+
+-     `DEMO_F.XPT`,   `DEMO_G.XPT`,   `DEMO_H.XPT`: demographic data
+-   `OHXPER_F.XPT`, `OHXPER_G.XPT`, `OHXPER_H.XPT`: periodontal examination data
+-      `SMQ_F.XPT`,    `SMQ_G.XPT`,    `SMQ_H.XPT`: smoking behavior
+-      `OHQ_F.XPT`,    `OHQ_G.XPT`,    `OHQ_H.XPT`: oral health questionnaire data
+
+Periodontal Examination Data (OHXPER) (eg. OHX02CJD) (Codebook are the same across years):
+
+-   OHX: variables starts with prefix "OHX"
+-   02: tooth numbers in universal tooth numbering system. 02 - 15, 18 - 31.
+-   CJ/PC/LA:
+    +  CJ, CEJGM (FGM to CEJ measurement) in mm;
+    +  PC, pocket depth (FGM to sulcus base) in mm; and
+    +  LA, CAL in mm ((FGM to CEJ measurement) - (FGM to sulcus base measurement))
+-   D/M/S/P/L/A:
+    +  D, distal, DF (Distobuccal, DB)
+    +  M, mid-facial, MdF (Buccal, B)
+    +  S, mesio-facial, MF (Mesiobuccal, MB)
+    +  P, distal - lingual, DL (Distolingual, DL)
+    +  L, mid - lingual, MdL (Lingual, L)
+    +  A, mesio- lingual, ML (Mesiolingual, ML)
+
+Definition of Covariates (DEMO, OHQ and SMQ) (Codebook are the same across years)：
+
+-   RIAGENDR: integer, Gender. 1, Male; 2, Female.
+-   RIDAGEYR: integer, Age in years at screening. 0 to 79, or 80 for 80 years of age and over.
+-   RIDRETH1: integer, Race/Hispanic origin. 1, Mexican American; 2, Other Hispanic; 3, Non-Hispanic White; 4, Non-Hispanic Black; 5, Other Race - Including Multi-Racial.
+-   ohq835: integer, Do you think you might have gum disease? 1, Yes; 2, No. 7, Refused; 9, Don't know; and NA values for missing.
+-   ohq850: integer, Ever had treatment for gum disease? 1, Yes; 2, No. 7, Refused; 9, Don't know; and NA values for missing.
+-   ohq855: integer, Any teeth became loose without an injury? 1, Yes; 2, No. 7, Refused; 9, Don't know; and NA values for missing.
+-   ohq860: integer, Ever been told of bone loss around teeth? 1, Yes; 2, No. 7, Refused; 9, Don't know; and NA values for missing.
+-   smk_stt: Boolean, derived from `smq020` and `smq 040`
+    -   If `SMQ020` AND `SMQ040` are both positive then YES, if else NO.
+    -   `smq020`: Smoked at least 100 cigarettes in life. 1, Yes; 2, No. 7, Refused; 9, Don't know; and NA values for missing.
+    -   `smq040`: Do you now smoke cigarettes? 1, Every day; 2, Some days; 3, Not at all. 7, Refused; 9, Don't know; and NA values for missing.
+
+
+```{r input and pre-process nhanes, cache=TRUE}
+OHXPER.F <- haven::read_xpt("../NHANES/OHXPER_F.xpt")
+OHXPER.G <- haven::read_xpt("../NHANES/OHXPER_G.xpt")
+OHXPER.H <- haven::read_xpt("../NHANES/OHXPER_H.xpt")
+if(all.equal(names(OHXPER.F), names(OHXPER.G)) &
+   all.equal(names(OHXPER.G), names(OHXPER.H)))
+  OHXPER.raw <- bind_rows(mutate(OHXPER.F, source = "F"), 
+                          mutate(OHXPER.G, source = "G"), 
+                          mutate(OHXPER.H, source = "H")) else
+    stop("variable names of OHXPER_F, OHXPER_G and OHXPER_H do not match")
+if(anyDuplicated(OHXPER.raw$SEQN))
+  stop("duplicated ids in OHXPER.raw")
+OHXPER.cleaned <- OHXPER.raw %>%
+  rename_with(.fn = tolower, .cols = everything()) %>%
+  mutate(across(.cols = starts_with("ohx"), .fns = \(x) na_if(x, 99))) %>%
+  select(seqn, source, matches("^(ohx)(\\d\\d)(pc|la)([dmspla])$"))
+
+DEMO.F <- haven::read_xpt("../NHANES/DEMO_F.xpt")
+DEMO.G <- haven::read_xpt("../NHANES/DEMO_G.xpt")
+DEMO.H <- haven::read_xpt("../NHANES/DEMO_H.xpt")
+DEMO <- bind_rows(
+  DEMO.F %>% select(SEQN, RIAGENDR, RIDAGEYR, RIDRETH1),
+  DEMO.G %>% select(SEQN, RIAGENDR, RIDAGEYR, RIDRETH1),
+  DEMO.H %>% select(SEQN, RIAGENDR, RIDAGEYR, RIDRETH1)) %>%
+  mutate(sex = case_match(RIAGENDR, 1 ~ "male", 2 ~ "female"),
+         age = RIDAGEYR,
+         race = case_match(RIDRETH1, c(1, 2) ~ "hispanic", 3 ~ "white", 
+                           4 ~ "black", 5 ~ "other")) %>%
+  rename_with(.fn = tolower, .cols = everything())
+stopifnot(!anyDuplicated(DEMO$seqn))
+
+OHQ.F <- haven::read_xpt("../NHANES/OHQ_F.xpt")
+OHQ.G <- haven::read_xpt("../NHANES/OHQ_G.xpt")
+OHQ.H <- haven::read_xpt("../NHANES/OHQ_H.xpt")
+OHQ <- bind_rows(
+  OHQ.F %>% select(SEQN, OHQ835, OHQ850, OHQ855, OHQ860),
+  OHQ.G %>% select(SEQN, OHQ835, OHQ850, OHQ855, OHQ860),
+  OHQ.H %>% select(SEQN, OHQ835, OHQ850, OHQ855, OHQ860)) %>%
+  rename_with(.fn = tolower, .cols = everything()) %>%
+  filter(!(is.na(ohq835) & is.na(ohq850) & is.na(ohq855) & is.na(ohq860))) %>%
+  mutate(across(.cols = starts_with("ohq"), 
+                .fns = \(x) case_match(x, 1 ~ "Y", 2 ~ "N", .default = NA)))
+stopifnot(!anyDuplicated(OHQ$seqn))
+
+SMK.F <- haven::read_xpt("../NHANES/SMQ_F.XPT")
+SMK.G <- haven::read_xpt("../NHANES/SMQ_G.XPT")
+SMK.H <- haven::read_xpt("../NHANES/SMQ_H.XPT")
+SMK <- bind_rows(
+  SMK.F %>% select(SEQN, SMQ020, SMQ040),
+  SMK.G %>% select(SEQN, SMQ020, SMQ040),
+  SMK.H %>% select(SEQN, SMQ020, SMQ040)) %>% 
+  rename_with(.fn = tolower, .cols = everything()) %>%
+  mutate(smq020 = case_match(smq020, 1 ~ "Y", 2 ~ "N", NA ~ ".", .default = "."),
+         smq040 = case_match(smq040, 1 ~ "Every day", 2 ~ "Some days", 
+                             3 ~ "Not at all", NA ~ ".", .default = ".")) %>%
+  mutate(smk_stt = (smq020 == "Y") & (smq040 %in% c("Every day", "Some days")))
+stopifnot(!anyDuplicated(SMK$seqn))
+
+nhanes <- OHXPER.cleaned %>% 
+  left_join(x = ., y = select(DEMO, seqn, age, sex, race), by = "seqn") %>%
+  left_join(x = ., y = select(OHQ, seqn, ohq835, ohq850, ohq855, ohq860), by = "seqn") %>%
+  left_join(x = ., y = select(SMK, seqn, smk_stt), by = "seqn") %>%
+  mutate(seqn = as.character(seqn))
+
+nhanes_select <- nhanes %>%
+  case_def() %>%
+  mutate(MS = (mod_12|sev_12)) %>%
+  mutate(across(.cols = starts_with("ohx"), 
+                .fns = \(x) cut(x, ordered_result = TRUE,
+                                breaks = c(-Inf, 0:(upper_bound-1)+0.01, Inf), 
+                                # -Inf 0.01 1.01 2.01 3.01 4.01 5.01  Inf
+                                labels = c(as.character(0:(upper_bound-1)),
+                                           str_glue("{upper_bound}/{upper_bound}+"))
+                                #    "0"  "1"  "2"  "3"  "4"  "5"  "6/6+"
+                ))) %>%
+  filter(n_NA_tooth_cal <= n_NA_tooth_cal_thre)
+saveRDS(object = nhanes_select, file = "../res/nhanes_extended.rds")
+nhanes_complete <- drop_na(nhanes_select, matches("ohx"))
+saveRDS(object = nhanes_complete, file = "../res/nhanes_complete.rds")
+```
+
+### ORIGINS data input
+
+Align the ORIGINS data with NHANES data
+
+Why 05 MB and 23 MB in ORIGINS seem to be outliers? 
+
+```{r, cache=TRUE}
+if(enable_origins){
+  #C1, Integer, Value Labels:(0) Present, Healthy(1) Crown(2) Implant(3) Veneers(4) Onlay(5) Missing(6) Root Tip(7) Impacted
+  #M1, Integer,  Value Labels:(0) no mobility; no greater than 0.25 mm(1) first sign or movement greater than normal, in a horizontal direction(2) movement of more than 1 mm in a horizontal direction(3) movement of &gt; 1 mm in both horizontal and vertical direction
+  #DB_PD1,  DB_CEJGM1,
+  # data periow2v1b;
+  # 	set periow2v1a;
+  # 	if REPROSTUDY = 0 ;
+  #
+  # 	if id = . then delete;
+  #
+  # 	array teetha_new [32] C1-C32; * tooth C1-C32;
+  # 	array pda_new [192] B_PD1-B_PD32 DB_PD1-DB_PD32 MB_PD1-MB_PD32 L_PD1-L_PD32 DL_PD1-DL_PD32 ML_PD1-ML_PD32;
+  # 	array gma_new [192] /* distance, negative values: over grow =1 to 15 mm*/ B_CEJGM1-B_CEJGM32 	DB_CEJGM1-DB_CEJGM32 MB_CEJGM1-MB_CEJGM32 L_CEJGM1-L_CEJGM32 DL_CEJGM1-DL_CEJGM32 ML_CEJGM1-ML_CEJGM32;
+  # 	array ala_new [192] /* sum of probing death and cej variables */ B_AL1-B_AL32 DB_AL1-DB_AL32 MB_AL1-MB_AL32 L_AL1-L_AL32 DL_AL1-DL_AL32 ML_AL1-ML_AL32;
+  # 	array bopa_new [192] /*bleeding*/ B_BOP1-B_BOP32 DB_BOP1-DB_BOP32 MB_BOP1-MB_BOP32 L_BOP1-L_BOP32 DL_BOP1-DL_BOP32 ML_BOP1-ML_BOP32;
+  
+  # *CALCULATE ATTACHMENT LOSS;
+  # do i = 1 to 192;
+  # if pda_new[i] le 15 and gma_new[i] le 15 then do;
+  # ala_new[i] = pda_new[i] + gma_new[i];
+  # end; end;
+  
+  # proc format;
+  # value raceethnf 0="d Hispanic" 1="c White" 2="Black" 3="a Other";
+  # value sexf 0='Male' 1='Female';
+  
+  # if DMQ003 = 1 then sex = 0; *male;
+  # else if DMQ003 = 2 then sex = 1; *female;
+  
+  # if dmq241 = 1 then raceethn = 0;else if /*hispanic*/
+  # DMQ_262_A_4 =1 then raceethn=1; else if /*white*/
+  # DMQ_262_A_2=1 then raceethn=2; else  /*blk*/
+  # if (DMQ_262_A_1 =1) or (DMQ_262_A_3 = 1) or (DMQ_262_A_5 =1) or (DMQ_262_A_8 =1) then raceethn=3; /*american indian, native haiw, other*/
+  origins <- read_sas("../ORIGINS/origins083123_kotsakis.sas7bdat")
+  covar_interested <- c("ID", "sex", "age", "raceethn")
+  
+  origins_temp <- origins %>% 
+    select(all_of(covar_interested), 
+           #matches("^(C|M)\\d{1,2}$"), 
+           matches("^(B|DB|MB|L|DL|ML)_(PD|CEJGM)\\d{1,2}$")) %>%
+    mutate(sex = case_match(sex, 0 ~ "male", 1 ~ "female")) %>%
+    rename("race" = "raceethn") %>%
+    mutate(race = case_match(race, 0 ~ "hispanic", 1 ~ "white", 
+                             2 ~ "black", 3 ~ "other")) %>%
+    pivot_longer(matches("^(B|DB|MB|L|DL|ML)_(PD|CEJGM)\\d{1,2}$"),
+                 names_to = "tooth_id", values_to = "value") %>%
+    mutate(tooth = str_extract(tooth_id, "\\d{1,2}"),
+           test = str_extract(tooth_id, "(PD|CEJGM)"),
+           site = str_extract(tooth_id, "(B|DB|MB|L|DL|ML)")) %>%
+    #Buccal (B), Mesiobuccal (MB), Distobuccal (DB), , 
+    #Lingual (L), Mesiolingual (ML), Distolingual (DL), 
+    #mid-facial (m), mesio-facial (s), distal (d), 
+    #mid-lingual (l), mesio-lingual (a), distal lingual (p)
+    mutate(test = case_match(test, "PD" ~ "pc", "CEJGM" ~ "cj"),
+           site = case_match(site, "B" ~ "m", "MB" ~ "s", "DB" ~ "d",
+                             "L" ~ "l", "ML" ~ "a", "DL" ~ "p")) %>%
+    mutate(value = if_else(value > 15 | value < -8, NA, value)) %>%
+    mutate(tooth = sprintf("%02d", as.numeric(tooth)))
+  origins_temp <- # create CAL measurement
+    bind_rows(origins_temp, 
+              (origins_temp %>% 
+                 group_by(ID, sex, age, race, tooth, site) %>% 
+                 summarise(value = sum(value), .groups = "drop") %>%
+                 mutate(test = "la")))
+  
+  origins_select <- origins_temp %>% 
+    filter(tooth %in% all_tooth,
+           test %in% c("pc", "la"),
+           site %in% c("d", "s", "p", "a", "m", "l")) %>%
+    rename("seqn" = "ID") %>%
+    mutate(tooth_id = str_c("ohx", tooth, test, site)) %>%
+    select(-tooth, -test, -site) %>%
+    pivot_wider(id_cols = c("seqn", "sex", "age", "race"),
+                names_from = "tooth_id", values_from = "value") %>%
+    mutate(seqn = as.character(seqn)) %>%
+    case_def() %>%
+    mutate(MS = (mod_12|sev_12)) %>%
+    mutate(across(.cols = starts_with("ohx"), 
+                  .fns = \(x) cut(x, ordered_result = TRUE,
+                                  breaks = c(-Inf, 0:(upper_bound-1)+0.01, Inf), 
+                                  # -Inf 0.01 1.01 2.01 3.01 4.01 5.01  Inf
+                                  labels = c(as.character(0:(upper_bound-1)),
+                                             str_glue("{upper_bound}/{upper_bound}+"))
+                                  #    "0"  "1"  "2"  "3"  "4"  "5"  "6/6+"
+                  ))) %>%
+    filter(n_NA_tooth_cal <= n_NA_tooth_cal_thre)
+  saveRDS(object = origins_select, file = "../res/origins_extended.rds")
+  origins_complete <- drop_na(origins_select, matches("ohx"))
+  saveRDS(object = origins_complete, file = "../res/origins_complete.rds")
+}
+```
+
+#### Outliers in ORIGINS
+
+
+
+```{r}
+if(enable_origins){
+  # +  D, distal, DF (Distobuccal, DB)
+  # +  M, mid-facial, MdF (Buccal, B)
+  # +  S, mesio-facial, MF (Mesiobuccal, MB)
+  # +  P, distal - lingual, DL (Distolingual, DL)
+  # +  L, mid - lingual, MdL (Lingual, L)
+  # +  A, mesio- lingual, ML (Mesiolingual, ML)
+  # 23 MB is adjacent site with 22 DB, but when ohx22lad == 0 or 1, ohx23las == 4
+  ggplot(origins_complete, aes(x= ohx23las, y = ohx22lad)) + 
+    geom_point(position = "jitter")
+  ggplot(origins_complete, aes(x= ohx23pcs, y = ohx22pcd)) + 
+    geom_point(position = "jitter") # for PPD, it looks normal
+  # 05 MB is adjacent site with 04 DB, but when ohx04lad == 0, ohx05las == 4
+  ggplot(origins_complete, aes(x= ohx05las, y = ohx04lad)) + 
+    geom_point(position = "jitter")
+  ggplot(origins_complete, aes(x= ohx05pcs, y = ohx04pcd)) + 
+    geom_point(position = "jitter") # for PPD, it looks normal
+  
+  outliers1 <- origins_complete %>% 
+    filter(ohx04lad == 0 & ohx05las == 4) %>%
+    pull(seqn)
+  outliers2 <- origins_complete %>% 
+    filter(ohx22lad == 0 & ohx23las == 4) %>%
+    pull(seqn)
+  length(outliers1) # 31
+  length(outliers2) # 26
+  length(intersect(outliers1, outliers2)) # 16, many of them are outliers by both categories
+  
+  origins %>% 
+    filter(ID %in% outliers1) %>% 
+    select(MB_PD5, MB_CEJGM5, MB_AL5, DB_PD4, DB_CEJGM4, DB_AL4) %>% 
+    print(n = 50)
+  
+  origins %>% 
+    filter(ID %in% outliers2) %>% 
+    select(MB_PD23, MB_CEJGM23, MB_AL23, DB_PD22, DB_CEJGM22, DB_AL22) %>% 
+    print(n = 50)
+  
+  origins_complete_filter <- origins_complete %>%
+    filter(!(seqn %in% c(outliers1, outliers2)))
+  # ORIGINS cohort has some data quality issue in that many individual have 4 mm
+  # difference in CEJ-GM between adjacent sites sharing the same interproximal space
+}
+get_adjacent_sites <- function(site_id = "MB_PD23"){
+  
+}
+```
+
+
+### ARIC data input
+
+Align the ARIC data with NHANES data.
+
+There are four site based measures:
+
++  Pocket Depth (PD)
++  Cemento-enamel Junction (CEJ) also known as recession
++  Bleeding on Probing (BL)
++  Attachment Loss (AL)
+
+The site based measures were taken on 6 sites per tooth:
+
++  Mesiobuccal (MB)
++  Buccal (B)
++  Distobuccal (DB)
++  Distolingual (DL)
++  Lingual (L)
++  Mesiolingual (ML)
+
+The names for all site based measures were crated by taking the measure + site + tooth number.  Examples: Pocket Depth measure for Mesiobuccal of tooth number 12 is PDMB12 and the Attachment Loss measure for buccal of tooth number 2 is ALB2.
+
+Pocket Depth: 
+
++  Variables:	PDss1—PDss32 (192 variables)
++  Codes:		0-15 measured in mm
+
+Cemento-enamel Junction (recession)
+
++  Variables:	CEJss1—CEJss32 (192 variables)
++  Codes:		-15 to 15 measured in mm
++  Notes:		Typically negative in this population. Negative number indicates recession. Positive number indicates the gingival margin is above the CEJ
+
+Attachment Loss
+
++  Variables:	ALss1—ALss32 (192 variables)
++  Codes:		0 to 30 measured in mm
++  Notes:		Calculated from PD and CEJ
+
+Bleeding on Probing
+
++  Variables:	BLss1—BLss32 (192 variables)
++  Codes:		0=No Bleeding on Probing. 1=Bleeding on Probing
+
+
+```{r, cache=TRUE}
+aric <- read_sas("../ARIC/AS1996.01 Dental Study V4/dentalaric.sas7bdat")
+aric_demo <- read_sas("../ARIC/AS1996.01 Dental Study V4/derive48_np.sas7bdat")
+stopifnot(anyDuplicated(aric$ID) == 0)
+stopifnot(sum(!(aric$ID %in% aric_demo$SUBJECTID)) == 0)
+aric_demo_select <- aric_demo %>% 
+  select(V4AGE41, RACEGRP, GENDER, SUBJECTID) %>%
+  rename("ID" = "SUBJECTID", "age" = "V4AGE41", 
+         "race" = "RACEGRP", "sex" = "GENDER") %>%
+  mutate(ID = as.character(ID),
+         age = as.numeric(age),
+         race = as.character(
+           case_match(race, "A" ~ "Asian or Pacific Islander",
+                      "B" ~ "black", "I" ~ "American Indian or Alaskan Indian",
+                      "W" ~ "white", .default = "undefined")),
+         sex = as.character(case_match(sex, "F" ~ "female", "M" ~ "male",
+                                       .default = "undefined")),
+         )
+aric <- dplyr::left_join(x = aric, y = aric_demo_select, by = "ID")
+
+################################################################################
+# Align the ARIC data with NHANES data
+################################################################################
+covar_interested <- c("ID", "sex", "age", "race")
+
+aric_temp <- aric %>% 
+  select(#all_of("ID"),
+         all_of(covar_interested),
+         #matches("^(C|M)\\d{1,2}$"), 
+         matches("^(PD|CEJ|AL)(B|DB|MB|L|DL|ML)(\\d{1,2})$")) %>%
+  # mutate(sex = case_match(sex, 0 ~ "male", 1 ~ "female")) %>%
+  # rename("race" = "raceethn") %>%
+  # mutate(race = case_match(race, 0 ~ "hispanic", 1 ~ "white", 
+                           # 2 ~ "black", 3 ~ "other")) %>%
+  pivot_longer(matches("^(PD|CEJ|AL)(B|DB|MB|L|DL|ML)(\\d{1,2})$"),
+               names_to = "tooth_id", values_to = "value") %>%
+  mutate(tooth = str_replace(tooth_id, replacement = "\\3",
+                             pattern = "^(PD|CEJ|AL)(B|DB|MB|L|DL|ML)(\\d{1,2})$"
+                             ),
+         test = str_replace(tooth_id, replacement = "\\1",
+                            pattern = "^(PD|CEJ|AL)(B|DB|MB|L|DL|ML)(\\d{1,2})$"
+                            ),
+         site = str_replace(tooth_id, replacement = "\\2",
+                            pattern = "^(PD|CEJ|AL)(B|DB|MB|L|DL|ML)(\\d{1,2})$"
+                            )) %>%
+  mutate(value = if_else(test == "CEJ", -value, value)) %>% # change to positive
+  #Buccal (B), Mesiobuccal (MB), Distobuccal (DB), , 
+  #Lingual (L), Mesiolingual (ML), Distolingual (DL), 
+  #mid-facial (m), mesio-facial (s), distal (d), 
+  #mid-lingual (l), mesio-lingual (a), distal lingual (p)
+  mutate(test = case_match(test, "PD" ~ "pc", "CEJ" ~ "cj", "AL" ~ "la"),
+         site = case_match(site, "B" ~ "m", "MB" ~ "s", "DB" ~ "d",
+                           "L" ~ "l", "ML" ~ "a", "DL" ~ "p")) %>%
+  mutate(value = if_else(value > 15 | value < -8, NA, value)) %>%
+  mutate(tooth = sprintf("%02d", as.numeric(tooth)))
+
+aric_select <- aric_temp %>% 
+  filter(tooth %in% all_tooth,
+         test %in% c("pc", "la"),
+         site %in% c("d", "s", "p", "a", "m", "l")) %>%
+  rename("seqn" = "ID") %>%
+  mutate(race = if_else(race %in% c("American Indian or Alaskan Indian",
+                                    "Asian or Pacific Islander"),
+                        "other", race)) %>%
+  mutate(tooth_id = str_c("ohx", tooth, test, site)) %>%
+  select(-tooth, -test, -site) %>%
+  pivot_wider(id_cols = c("seqn", "age", "sex", "race"),
+              names_from = "tooth_id", values_from = "value") %>%
+  mutate(seqn = as.character(seqn)) %>%
+  case_def() %>%
+  mutate(MS = (mod_12|sev_12)) %>%
+  mutate(across(.cols = starts_with("ohx"), 
+                .fns = \(x) cut(x, ordered_result = TRUE,
+                                breaks = c(-Inf, 0:(upper_bound-1)+0.01, Inf), 
+                                # -Inf 0.01 1.01 2.01 3.01 4.01 5.01  Inf
+                                labels = c(as.character(0:(upper_bound-1)),
+                                           str_glue("{upper_bound}/{upper_bound}+"))
+                                #    "0"  "1"  "2"  "3"  "4"  "5"  "6/6+"
+                ))) %>%
+  filter(n_NA_tooth_cal <= n_NA_tooth_cal_thre)
+saveRDS(object = aric_select, file = "../res/aric_extended.rds")
+aric_complete <- drop_na(aric_select, matches("ohx"))
+saveRDS(object = aric_complete, file = "../res/aric_complete.rds")
+```
+
+### Temple Data
+
++  Total pts
+    -  12,419 All complete pts
+    -  89,937 all pts
++  Gender
+    -  Female  7171
+    -  Male 5233
+    -  Other 15
+    -  Total 12419
++  Race
+    -  UNKNOWN 8786
+    -  BLACK 2347
+    -  WHITE 1002
+    -  ASIAN 264
+    -  OTHER 20
++  Age
+    -  Mean 33.1648
+    -  std 13.6406
++  Periodontitis
+    -  MS: 8635 (69.5)
+    -  S: 2002 (16.1)
+    -  M: 6633 (53.4)
+
+
+### Description of the combined dataset
+
++  The combined dataset follows the NHANES naming convention, with `seqn` for IDs, `race` values as Black, White, Hispanic, and Other, `sex` values as Male and Female, and age. 
++  The naming convention for periodontal measurements also follows NHANES, starting with the prefix "ohx," followed by a two-digit tooth number, and ending with three characters describing the measurement and sites. 
++  The periodontal measurements have been converted into ordinal variables, ranging from 1 to 6/6+. 
++  It includes other derived variables, such as periodontal disease cases defined by the 2012 AAP/CDC or 2018 AAP/EFP definitions, as well as the number of missing teeth and sites. Additionally, a variable called `from` tracks which cohort the subject belongs to. 
++  `combined_cohorts`: It includes only complete cases with no missing values. `extended_cohorts`: It includes all cases with at least 28 - `n_NA_tooth_cal_thre` (currently 6) teeth.
+
+```{r combined cohorts}
+if(enable_origins){
+  common_var <- intersect(names(aric_complete),
+                          intersect(names(origins_complete), 
+                                    names(nhanes_complete)))
+  # common_var: seqn, age, sex, race, ohx, ps_12, mil_12, mod_12, sev_12, ps_18,
+  # mod_18, sev_18, n_NA_site_cal, n_NA_tooth_cal, MS
+  stopifnot(anyDuplicated(c(origins_complete$seqn, nhanes_complete$seqn, 
+                            aric_complete$seqn)) == 0)
+  combined_cohorts <- bind_rows(mutate(select(origins_complete, all_of(common_var)), 
+                                       from = "ORIGINS"), 
+                                mutate(select(nhanes_complete, all_of(common_var)), 
+                                       from = "NHANES"),
+                                mutate(select(aric_complete, all_of(common_var)),
+                                       from = "ARIC"))
+  saveRDS(object = combined_cohorts, file = "../res/combined_cohort.rds")
+  stopifnot(anyDuplicated(c(origins_select$seqn, nhanes_select$seqn, 
+                            aric_select$seqn)) == 0)
+  extended_cohorts <- bind_rows(mutate(select(origins_select, all_of(common_var)), 
+                                       from = "ORIGINS"), 
+                                mutate(select(nhanes_select, all_of(common_var)), 
+                                       from = "NHANES"),
+                                mutate(select(aric_select, all_of(common_var)),
+                                       from = "ARIC"))
+  saveRDS(object = extended_cohorts, file = "../res/extended_cohort.rds")
+} else {
+  common_var <- intersect(names(aric_complete),names(nhanes_complete))
+  # common_var: seqn, age, sex, race, ohx, ps_12, mil_12, mod_12, sev_12, ps_18,
+  # mod_18, sev_18, n_NA_site_cal, n_NA_tooth_cal, MS
+  stopifnot(anyDuplicated(c(nhanes_complete$seqn, aric_complete$seqn)) == 0)
+  combined_cohorts <- 
+    bind_rows(mutate(select(nhanes_complete, all_of(common_var)), from = "NHANES"),
+              mutate(select(aric_complete, all_of(common_var)), from = "ARIC"))
+  saveRDS(object = combined_cohorts, file = "../res/combined_cohort.rds")
+  stopifnot(anyDuplicated(c(nhanes_select$seqn, aric_select$seqn)) == 0)
+  extended_cohorts <- bind_rows(mutate(select(nhanes_select, all_of(common_var)), 
+                                       from = "NHANES"),
+                                mutate(select(aric_select, all_of(common_var)),
+                                       from = "ARIC"))
+  saveRDS(object = extended_cohorts, file = "../res/extended_cohort.rds")
+}
+
+```
+
+## Our Method: Generative Classifier based on Gibbs Sampling 
+
+### Model Fitting
+
+```{r, eval = TRUE, echo = FALSE}
+source("../src/Model Fit.R")
+```
+
+```{r, file = '../src/Model Fit.R', eval = FALSE, echo = TRUE}
+```
+
+### Model Prediction
+
+```{r, eval = FALSE, echo = FALSE}
+source("../src/Model Predict.R")
+```
+
+```{r, file = '../src/Model Predict.R', eval = FALSE, echo = TRUE}
+```
+
+
+# Results
+
+## Demographic Characteristics of complete cases in the combined study cohort.
+
+```{r}
+library(tableone)
+TableOne2Kable <- function(TableOne){
+  temp <- TableOne %>% 
+    print(
+        printToggle      = FALSE,
+        showAllLevels    = TRUE
+    ) %>% 
+    {data.frame(
+        Variable         = str_remove_all(gsub(" ", "&nbsp;", rownames(.), 
+                                               fixed = TRUE), "&nbsp;"), ., 
+        row.names        = NULL, 
+        check.names      = FALSE, 
+        stringsAsFactors = FALSE)}
+  return(temp)
+}
+combined_cohorts %>%
+  CreateTableOne(data = ., includeNA = TRUE,
+                 vars = c("age", "sex", "race", 
+                          "n_NA_tooth_cal", "n_NA_site_cal",
+                          "MS", "sev_12"),
+                 test = FALSE, strata = "from",
+                 addOverall = F) %>%
+  TableOne2Kable() %>%
+  kable(caption = "Summary Table for Demogrephics in Study Cohorts (Complete Cases)") %>%
+  kable_classic(full_width = F, html_font = "Cambria") 
+extended_cohorts %>%
+  CreateTableOne(data = ., includeNA = TRUE,
+                 vars = c("age", "sex", "race", 
+                          "n_NA_tooth_cal", "n_NA_site_cal",
+                          "MS", "sev_12"),
+                 test = FALSE, strata = "from",
+                 addOverall = F) %>%
+  TableOne2Kable() %>%
+  kable(caption = "Summary Table for Demogrephics in Study Cohorts (<6 Tooth Losses)") %>%
+  kable_classic(full_width = F, html_font = "Cambria") 
+```
+
+## CONSORT flow chart
+
+```{r}
+if(enable_origins){
+  cat("There are a total of", nrow(nhanes) + nrow(origins) + nrow(aric),
+      "subjects in the study cohort. From them", nrow(nhanes), "subjects from",
+      "NHANES (2009-2014),", nrow(origins), "from ORIGINS, and",
+      nrow(aric), "from ARIC (visit 4).", "From them,", nrow(nhanes_select), 
+      nrow(origins_select), "and", nrow(aric_select), 
+      "individuals have at least", 28-n_NA_tooth_cal_thre, "teeth present from",
+      "the NHANES, ORIGINS and ARIC, respectively.",
+      "Out of these subjects, there are", nrow(nhanes_complete), nrow(origins_complete),
+      nrow(aric_complete), "subject are complete cases, respectively.",
+      "The NHANES complete cases are used from model training and test,",
+      "and the ARIC complete cases are used for model validation.")
+} else {
+  cat("There are a total of", nrow(nhanes) + nrow(aric),
+      "subjects in the study cohort. From them", nrow(nhanes), "subjects from",
+      "NHANES (2009-2014), and",
+      nrow(aric), "from ARIC (visit 4).", "From them,", nrow(nhanes_select), 
+      "and", nrow(aric_select), 
+      "individuals have at least", 28-n_NA_tooth_cal_thre, "teeth present from",
+      "the NHANES and ARIC, respectively.",
+      "Out of these subjects, there are", nrow(nhanes_complete), 
+      nrow(aric_complete), "subject are complete cases, respectively.",
+      "The NHANES complete cases are used from model training and test,",
+      "and the ARIC complete cases are used for model validation.")
+}
+```
+
+
+## Distribution of CAL and PD in NHANES and ARIC and Temple
+
+```{r, fig.width=12, fig.height=ifelse(enable_origins, 6, 4)}
+# Number of PD >=5 and CAL >= 4 in teeth
+summary_df <- combined_cohorts %>% # data_normalized: seqn, ohx 0-6, mod_12, sev_12, MS
+  pivot_longer(cols = starts_with("ohx"), 
+               names_to = "tooth_id", 
+               values_to = "value") %>%
+  mutate(
+    tooth = str_extract(tooth_id, "\\d\\d"),
+    test  = str_extract(tooth_id, "pc|la"),
+    site  = str_extract(tooth_id, "[dspaml]$")
+  ) %>%
+  mutate(
+    site = case_match(site,
+                      "d" ~ "DB", "s" ~ "MB", "m" ~ "B",
+                      "p" ~ "DL", "a" ~ "ML", "l" ~ "L"),
+    site = factor(site, levels = c("DB", "B", "MB", "DL", "L", "ML"))) %>%
+  # filter(test == "la") %>%
+  count(from, tooth, site, value, test, name = "ct")
+temple_summary <- readRDS("../Temple/summary_df.rds") %>%
+  mutate(value = as.ordered(value)) %>%
+  mutate(value = fct_recode(value, "6/6+" = "6"))
+summary_df <- bind_rows(summary_df, temple_summary)
+cal_dist <- summary_df %>%
+  filter(test == "la") %>%
+  ggplot(aes(x = tooth, fill = value, y = ct)) +
+  geom_bar(color = NA, position = position_stack(reverse = FALSE),
+           stat = "identity") + 
+  geom_vline(xintercept = length(all_tooth)/2+0.5, 
+             color = "grey20", linetype = "dashed") + 
+  facet_grid(from~site, scales = "free_y") + 
+  theme_bw() + 
+  scale_fill_brewer(name = "CAL/mm", palette = "YlGnBu") +
+  labs(x = "Tooth Number", y = "Number of Subjects") + 
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1, size = 6),
+                      #element_text(angle = 45, vjust = 1, hjust=1, size = 6),
+        panel.grid = element_blank())
+ggsave(plot = cal_dist, filename = "../res/cal_dist.jpeg", 
+       width = 12, height = ifelse(enable_origins, 8, 6))
+ggsave(plot = cal_dist, filename = "../res/cal_dist.pdf", 
+       width = 12, height = ifelse(enable_origins, 8, 6))
+cal_dist
+
+pd_dist <- summary_df %>%
+  filter(test == "pc") %>%
+  ggplot(aes(x = tooth, fill = value, y= ct)) +
+  geom_bar(color = NA, position = position_stack(reverse = FALSE),
+           stat = "identity") + 
+  geom_vline(xintercept = length(all_tooth)/2+0.5, 
+             color = "grey20", linetype = "dashed") + 
+  facet_grid(from~site, scales = "free_y") + 
+  theme_bw() + 
+  scale_fill_brewer(name = "PD/mm", palette = "YlGnBu") +
+  labs(x = "Tooth Number", y = "Number of Subjects") + 
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1, size = 6),
+                      #element_text(angle = 45, vjust = 1, hjust=1, size = 6),
+        panel.grid = element_blank())
+ggsave(plot = pd_dist, filename = "../res/pd_dist.jpeg", 
+       width = 12, height = ifelse(enable_origins, 8, 6))
+ggsave(plot = pd_dist, filename = "../res/pd_dist.pdf", 
+       width = 12, height = ifelse(enable_origins, 8, 6))
+pd_dist
+```
+
+
+
+## Evolutionary Algorithm and Best Tooth Combinations
+
+(Calculated using high-performance computing resources.)
+
+```{r, file = "../src/EA_0621.R", eval = FALSE}
+```
+
+### Which tooth are more likely to be selected in top 6-tooth combinations by EA?
+
+```{r, fig.width=6, fig.height=4}
+n_top = 20
+n_teeth = 6
+fp_1 = c("GenClassifier" = "EA_", "RandomForest" = "EA_rf_", "SimplePME" = "EA_naive_")
+fp_2 = c("GenClassifier" = "_0621", "RandomForest" = "_0722", "SimplePME" = "_0805")
+tooth_freq = list("GenClassifier" = character(0), 
+                  "RandomForest" = character(0),
+                  "SimplePME" = character(0))
+Methods = c("SimplePME", "GenClassifier", "RandomForest")
+
+for(meth in Methods){
+  aucres <- readRDS(str_glue("../res/{fp_1[meth]}aucvec{fp_2[meth]}.rds"))
+  stopifnot(n_top == readRDS(str_glue("../res/{fp_1[meth]}ntop{fp_2[meth]}.rds")))
+  auctop <- sort(aucres, decreasing = TRUE)[1:n_top]
+  tooth_freq[[meth]] <- c(sapply(X = names(auctop), FUN = str_sub, 
+                                 start = (1:n_teeth)*2-1, 
+                                 end = (1:n_teeth)*2))
+}
+tooth_solution_freq <- as.data.frame(tooth_freq) %>% 
+  pivot_longer(cols = all_of(Methods), names_to = "Methods", 
+               values_to = "Tooth Number") %>%
+  mutate(`Tooth Number` = factor(`Tooth Number`, levels = all_tooth)) %>%
+  count(Methods, `Tooth Number`, .drop = FALSE) %>%
+  pivot_wider(names_from = `Tooth Number`, values_from = n) %>%
+  column_to_rownames(var = "Methods") %>%
+  as.matrix()
+tooth_solution_freq
+rownames(tooth_solution_freq) <- 
+  case_match(rownames(tooth_solution_freq), 
+             "GenClassifier" ~ "GenClassifier (Ours)",
+             "RandomForest" ~ "RandomForest (Competing)",
+             "SimplePME" ~ "SimplePME (Competing)")
+tooth_solution_freq_fig <- 
+  plot_tooth_heatmap(values = tooth_solution_freq/n_top*100,
+                     n_colors = 8,
+                     output_svg = "../res/tooth_solution_freq.svg",
+                     legend_title = "Top Freq. (%)")
+grid::grid.draw(tooth_solution_freq_fig)
+ggsave(plot = tooth_solution_freq_fig, 
+       filename = "../res/tooth_solution_freq.jpeg", 
+       width = 8, height = 2.5)
+ggsave(plot = tooth_solution_freq_fig, 
+       filename = "../res/tooth_solution_freq.pdf", 
+       width = 8, height = 2.5)
+```
+
+### Which 6-tooth combinations are selected by EA for the generative classifier? 
+
+```{r}
+DD = "0621"
+n_top_solutions <- readRDS(str_glue("../res/EA_ntop_{DD}.rds")) # how many top solutions to show. It may be better to use the number of "elites" during EA
+solution_history <- readRDS(str_glue("../res/EA_record_{DD}.rds"))
+plot(solution_history$auc) # good
+
+aucvec <- readRDS(str_glue("../res/EA_aucvec_{DD}.rds")) # aucs of all re-evaluated final solutions (~100)
+senvec <- readRDS(str_glue("../res/EA_senvec_{DD}.rds"))
+# solutions <- readRDS(str_glue("../res/EA_solutions_{DD}.rds")) # raw solutions from EA. Not used. use the re-calculated AUCs
+# solutions <- as.data.frame(aucvec) %>% 
+#   rownames_to_column("regimen") %>%
+#   left_join(x = ., y = solutions)
+# solutions %>% 
+#   drop_na() %>%
+#   ggplot(aes(x = ave_auc, y = aucvec, color = repeated_n)) +
+#   geom_point() +
+#   geom_abline(intercept = 0, slope = 1, color = "firebrick") +
+#   geom_hline(yintercept = sort(solutions$aucvec, decreasing = TRUE)[n_top_solutions],
+#              color = c("green4"))+
+#   geom_vline(xintercept = sort(solutions$ave_auc, decreasing = TRUE)[n_top_solutions],
+#              color = c("royalblue3"))+
+#   geom_vline(xintercept = sort(solutions$ave_auc, decreasing = TRUE)[50],
+#              color = c("purple"))+
+#   labs(x = "Raw EA AUCs", y = "Re-Calculated AUCs") + 
+#   scale_colour_viridis_b(option = "inferno", direction = -1, 
+#                          name = "EA Visited Times") + 
+#   theme_bw() 
+# to get an accurate estimate of AUC, re-calculation is required
+# 14 solutions are common top-20 solutions
+# recalculate the top 50 solutions can largely cover the true top 20 solutions
+
+aucvec_top <- sort(aucvec, decreasing = TRUE)[1:n_top_solutions]
+n_teeth <- nchar(names(aucvec)[1])/2
+num.molar <- \(teeth){
+  return(sum(teeth %in% c("02", "03", "14", "15", "18", "19", "30", "31")))
+}
+num.lower <- \(teeth){
+  return(sum( as.integer(teeth)>=18 & as.integer(teeth)<=31 ))
+}
+
+solutions <- as.data.frame(aucvec_top) %>%
+  rownames_to_column(var = "ID") %>%
+  rename("auc" = "aucvec_top") %>%
+  mutate(senstivity = senvec[ID]) %>%
+  separate_wider_position(cols = ID, cols_remove = FALSE,
+                          width = setNames(rep(2,n_teeth), 
+                                           paste("V",1:n_teeth,sep =""))) %>%
+  rowwise()%>%
+  mutate(num_molars = num.molar(c_across(starts_with("V"))),
+         num_lowers = num.lower(c_across(starts_with("V")))) %>%
+  ungroup()
+  
+# calculate the dist and do a clustering
+# dist = # of different teeth
+solutions_dist <- matrix(0, nrow = nrow(solutions), ncol = nrow(solutions), 
+                         dimnames = list(solutions$ID, solutions$ID))
+for(i in 1:(nrow(solutions)-1))
+  for(j in (i+1):nrow(solutions)){
+    common_teeths <- intersect(unlist(solutions[i, paste("V",1:n_teeth,sep ="")]),
+                               unlist(solutions[j, paste("V",1:n_teeth,sep ="")]))
+    diss_ij = n_teeth - length(common_teeths)
+    if(diss_ij == 1){
+      tooth_1 <- setdiff(unlist(solutions[i, paste("V",1:n_teeth,sep ="")]),
+                         unlist(solutions[j, paste("V",1:n_teeth,sep ="")]))
+      tooth_2 <- setdiff(unlist(solutions[j, paste("V",1:n_teeth,sep ="")]),
+                         unlist(solutions[i, paste("V",1:n_teeth,sep ="")]))
+      if(abs(as.numeric(tooth_1) - as.numeric(tooth_2)) == 1) # adjacent
+        diss_ij = diss_ij - 0.05 # this will violate the distance axioms
+    }
+    solutions_dist[i, j] <- solutions_dist[j, i] <- diss_ij
+  }
+solutions_dist <- as.dist(solutions_dist)
+
+
+# create a tree
+solutions_cluster <- solutions_dist %>%
+  hclust(., method = "average") %>%
+  ape::as.phylo() %>%
+  ape::di2multi()
+# collapse very close nodes (for a better plot!)
+solutions_cluster$edge.length <- 
+  if_else(solutions_cluster$edge.length > 0.05,
+          solutions_cluster$edge.length, 0)
+solutions_cluster <- ape::di2multi(solutions_cluster)
+# add node labels
+solutions_cluster$node.label <- 
+  sapply(X = 1:ape::Nnode(solutions_cluster), simplify = TRUE,
+       FUN = function(node_id){
+         node_id = node_id + ape::Ntip(solutions_cluster)
+         tip_ids <- phytools::getDescendants(solutions_cluster, node = node_id)
+         tip_ids <- tip_ids[tip_ids <= ape::Ntip(solutions_cluster)]
+         tip_labels <- solutions_cluster$tip.label[tip_ids]
+         tooth_occurrence <- 
+           c(sapply(tip_labels, FUN = substring, 
+                    first = seq(1, 6*2, by = 2), last = seq(1, 6*2, by = 2)+1))
+         tooth_occurrence <- plyr::count(tooth_occurrence)
+         shared_tooth <- tooth_occurrence$x[tooth_occurrence$freq == length(tip_labels)]
+         return(paste(sort(shared_tooth), collapse = ", "))
+       })
+# reduce the end edge length (for better plots!)
+tip_edge_index <- solutions_cluster$edge[,2] <= ape::Ntip(solutions_cluster)
+solutions_cluster$edge.length[tip_edge_index] <-
+  solutions_cluster$edge.length[tip_edge_index] - 0.25
+# edit the tip labels so that they only show the difference from the nearest node
+solutions_cluster$short_label <- 
+  sapply(X = 1:ape::Ntip(solutions_cluster), simplify = TRUE,
+       FUN = function(tip_id){
+         parent_node <- phytools::getParent(solutions_cluster, node = tip_id) # the nearest parent
+         parent_node_id <- parent_node - ape::Ntip(solutions_cluster)
+         parent_node_label <- solutions_cluster$node.label[parent_node_id]
+         parent_solution <- str_split_1(parent_node_label, pattern = ", ")
+         tip_label <- solutions_cluster$tip.label[tip_id]
+         tip_solution <- str_sub(tip_label, start = (1:6)*2-1, end = (1:6)*2)
+         tip_label_diff <- setdiff(tip_solution, parent_solution)
+         return(paste(sort(tip_label_diff), collapse = " & "))
+       })
+  
+
+# plot
+solutions_cluster_fig <- ggtree(solutions_cluster, layout = "dendrogram") + 
+  geom_tiplab(mapping = aes(label=c(solutions_cluster$short_label, 
+                                    solutions_cluster$node.label)),
+              offset = -0.02, angle = 30, hjust = 0.5) + 
+  # some comments here:
+  # the tip labels are arranged in the the original order (as in `solutions`)
+  # the tip labels also correspond to the tip id (1-20)
+  # but tips are not arranged in the order of tip labels in the plot
+  # that means they have different aes(x, y) settings from tip ids
+  # the node labels here will not be used in geom_tiplab() 
+  # the node labels extend `mapping` vector to 38 elements
+  # the short_label should correspond to tip labels
+  # the short_label will inherit (x, y) directly from the tree
+  geom_nodelab(geom = "label", vjust =-0.2, hjust = 0.5, 
+               color= "steelblue4", size = 3, alpha = 0.8, 
+               angle= 30)
+solutions_cluster_annotation <- solutions %>%
+  column_to_rownames("ID") %>%
+  select(auc) %>%
+  rename(AUC = "auc")
+# another comment: 
+# gheatmap creates a heatmap according to rownames of annotation data and tip labels
+# therefore, while we can show duplicated tip labels, we can not assign correct values
+# in the heatmaps to multiple tips with the same tip labels.
+# create a short_label will be a better solution
+solutions_cluster_fig <- gheatmap(p = solutions_cluster_fig, colnames = FALSE,
+                                  data = solutions_cluster_annotation, 
+                                  width = 0.2, offset = 0.02) + 
+  scale_fill_binned(name = "AUC",type = "viridis", 
+                    breaks = seq(floor(min(aucvec_top)*1000)/1000, 
+                                 ceiling(max(aucvec_top)*1000)/1000, 
+                                 by = 0.001),
+                    limits = c(floor(min(aucvec_top)*1000)/1000, 
+                               ceiling(max(aucvec_top)*1000)/1000)) +
+  theme(plot.margin = unit(c(0, 0, 0, 15), "pt"))
+print(solutions_cluster_fig)
+ggsave(plot = solutions_cluster_fig, filename = "../res/solutions_dendro.jpeg", 
+       width = 8, height = 4)
+ggsave(plot = solutions_cluster_fig, filename = "../res/solutions_dendro.pdf", 
+       width = 8, height = 4)
+```
+
+### The best 6-tooth combination and its family members (4- to 14-tooth combinations)
+
+```{r}
+n_top = 20
+n_teeths = c("0714" = 14, "0713" = 8, "0621" = 6, "0711" = 5, "0712" = 4)
+tooth_combination = c("03", "14", "18", "25", "30", "31")
+# tooth_combination = c("03", "08", "15", "18", "19", "25", "30", "31")
+num.molar <- \(teeth){
+  return(sum(teeth %in% c("02", "03", "14", "15", "18", "19", "30", "31")))
+}
+num.lower <- \(teeth){
+  return(sum( as.integer(teeth)>=18 & as.integer(teeth)<=31 ))
+}
+family.of.selected <- \(t_c, best_tc = c("03", "14", "18", "25", "30", "31")){
+  return(length(intersect(t_c, best_tc)) == min(length(best_tc), length(t_c)))
+}
+
+solution_tot<- tibble(ID = character(), n_teeth = numeric(),
+                      auc = numeric(), sd = numeric(), senstivity = numeric(),
+                      num_molars = numeric(), num_lowers = numeric(),
+                      selected_family = logical())
+for(iiii in 1:length(n_teeths)){
+  n_teeth <- n_teeths[iiii]
+  aucres <- readRDS(str_glue("../res/EA_aucvec_{names(n_teeths)[iiii]}.rds"))
+  senres <- readRDS(str_glue("../res/EA_senvec_{names(n_teeths)[iiii]}.rds"))
+  aucsd <- readRDS(str_glue("../res/EA_aucsd_{names(n_teeths)[iiii]}.rds"))
+  
+  stopifnot(n_top == readRDS(str_glue("../res/EA_ntop_{names(n_teeths)[iiii]}.rds")))
+  
+  aucvec_top <- sort(aucres, decreasing = TRUE)[1:n_top]
+
+  solutions <- as.data.frame(aucvec_top) %>%
+    rownames_to_column(var = "ID") %>%
+    rename("auc" = "aucvec_top") %>%
+    mutate(senstivity = senres[ID],
+           sd = aucsd[ID]) %>%
+    separate_wider_position(cols = ID, cols_remove = FALSE,
+                            width = setNames(rep(2,n_teeth), 
+                                             paste("V",1:n_teeth,sep =""))) %>%
+    rowwise()%>%
+    mutate(num_molars = num.molar(c_across(starts_with("V"))),
+           num_lowers = num.lower(c_across(starts_with("V"))),
+           selected_family = family.of.selected(c_across(starts_with("V")), 
+                                                tooth_combination)) %>%
+    # family.of.selected can only compare two combinations if one contains
+    # the other. In our case, we are actually comparing across 5 combinations
+    # more complicated.
+    # (but it works <just in this case.>)
+    ungroup()%>%
+    mutate(n_teeth = n_teeth, rank = n_top - rank(auc) + 1) %>% # the highest rank, the highest AUC
+    select(-starts_with("V"))
+  solution_tot <- bind_rows(solution_tot, solutions)
+}
+solution_tot <- solution_tot %>%
+  group_by(n_teeth, selected_family) %>%
+  slice_max(order_by = auc, n = 1) %>%
+  mutate(note = 
+           if_else(n_teeth == 14, 
+                   str_glue("Sens: {round(senstivity*100, 0)}%"),
+                   str_glue("{round(senstivity*100, 0)}%"))) %>%
+  bind_rows(.,
+            tibble(n_teeth = 28, auc = 1, sd = 0, senstivity = 1, 
+                   selected_family = FALSE, rank = 1, note = NA))
+  
+solution_family_fig <-
+  bind_rows(solution_tot %>% filter(rank == 1) %>% mutate(type = "Best", note = NA),
+            solution_tot %>% filter(selected_family) %>% mutate(type = "Perio6 Lineage")) %>%
+  mutate(type = factor(type, levels = c("Best", "Perio6 Lineage"))) %>%
+  ggplot(aes(y = auc, x = n_teeth, color = type)) +
+  geom_errorbar(data = ~subset(., selected_family), # put at the bottom
+                aes(ymin = auc-sd, ymax = auc+sd))+
+  geom_point() + 
+  geom_line(aes(linetype = type, group = type)) + 
+  geom_text_repel(aes(label = note), nudge_y = 0, nudge_x = -1, 
+                  color = "grey10", box.padding = 0.5, point.padding = 0.5) + 
+  # geom_text(data = ~subset(., selected_family), aes(label = note), 
+  #           color = "grey10", nudge_y = 0, nudge_x = 0, 
+  #           #angle = 30, #hjust = 1, vjust = 1,
+  #           check_overlap = FALSE) + 
+  scale_color_manual(values = c("grey40", "#e41a1c"), name = "Type")+
+  scale_linetype_manual(values = c("dashed", "solid"), name = "Type")+
+  scale_x_continuous(name = "Number of Input Teeth", 
+                     breaks = c(0,unique(solution_tot$n_teeth)),
+                     minor_breaks = NULL,
+                     limits = c(0,28)) + 
+  scale_y_continuous(name = "AUC", 
+                     breaks = seq(0.96, 1, by = 0.01),
+                     limits = c(0.96, 1)) + 
+  annotate("text", x = 27, y = 0.998, label = "Gold", color = "grey10") + 
+  theme_bw() + guides(color=guide_legend(title="Type")) + 
+  theme(legend.position="bottom")
+
+# create tooth combination figures
+solutions_family <- solution_tot$ID[solution_tot$selected_family]
+solutions_family <- solutions_family[!is.na(solutions_family)]
+x_min <- c(5   , 6   , 10  , 18  , 16)
+y_max <- c(0.97, 0.98, 0.99, 0.99, 1)
+#   seq(5, 19, length.out = length(solutions_family))
+# x_max <- seq(14, 28, length.out = length(solutions_family))
+# y_min <- seq(0.964, 0.994, length.out = length(solutions_family))
+# y_max <- seq(0.972, 1.003, length.out = length(solutions_family))
+for(iiii in 1:length(solutions_family)){
+  tc = solutions_family[iiii]
+  n_teeth <- nchar(tc)/2
+  t_ids <- str_sub(string = tc, start = (1:n_teeth)*2-1, end = (1:n_teeth)*2)
+  output_svg <- str_glue("../res/{tc}.svg")
+  y_pos <- filter(solution_tot, ID == tc)[["auc"]]
+  
+  paint_tooth(t_ids, colors = rep("#FF6454", length = length(t_ids)), 
+              output_file = output_svg)
+  svg_magick <- magick::image_read(rsvg::rsvg(output_svg, width = 300)) %>% # read back
+    magick::image_background("rgba(255,255,255,0.5)") %>% # add a background color to make it not so transparent
+    magick::image_flatten()
+  solution_family_fig <- solution_family_fig + 
+    annotation_custom(
+      grid::rasterGrob(svg_magick, interpolate = TRUE),
+      xmin = x_min[iiii], xmax = x_min[iiii] + 6,  # the scale does not matter. It will be centered at (0,0)
+      ymin = y_max[iiii] - 0.01, ymax = y_max[iiii])
+  if(n_teeth == 6){
+    solution_family_fig <- solution_family_fig + 
+      annotate(
+        "rect",
+        xmin = x_min[iiii] + 0.5, xmax = x_min[iiii] + 6 - 0.5,  # the scale does not matter. It will be centered at (0,0)
+        ymin = y_max[iiii] - 0.01, ymax = y_max[iiii],
+        fill = "NA", color = "firebrick3", linewidth = 0.5, linetype = "dashed")
+  }
+}
+solution_family_fig 
+ggsave(filename = "../res/solution_family_fig.jpeg", 
+       plot = solution_family_fig, width = 6, height = 6.5)
+ggsave(filename = "../res/solution_family_fig.pdf", 
+       plot = solution_family_fig, width = 6, height = 6.5)
+```
+
+### Combined figure for best tooth combination
+
+```{r}
+left_column <- plot_grid(
+  tooth_solution_freq_fig,
+  solutions_cluster_fig,
+  ncol = 1,
+  rel_heights = c(2.5, 4),
+  labels = c("(a)", "(b)")
+)
+right_column <- plot_grid(solution_family_fig, labels = "(c)")
+tooth_selection_comb_fig <- plot_grid(
+  left_column,
+  right_column,
+  rel_widths = c(8, 6)
+)
+tooth_selection_comb_fig
+ggsave(filename = "../res/tooth_selection_comb_fig.jpeg", 
+       plot = tooth_selection_comb_fig, width = 14, height = 6.5)
+ggsave(filename = "../res/tooth_selection_comb_fig.pdf", 
+       plot = tooth_selection_comb_fig, width = 14, height = 6.5)
+
+```
+
+## Spatial correlation between periodontal measures and network analysis
+
+```{r, fig.width=10, fig.height=6}
+library(igraph)
+interested_teeth <- table(tooth_freq[["GenClassifier"]])
+interested_teeth <- names(interested_teeth[interested_teeth>5]) #"03" "14" "15" "18" "19" "25" "30" "31"
+source(str_glue("../src/get.adjacency.R"))
+nhanes_cal_mdl <- readRDS(str_glue("../res/nhanes_cal_genmdl_ord.rds"))
+adjacency_mat <- get.adjacency(object = nhanes_cal_mdl, 
+                               whichLambda = 1) # 1-6, 1 for the least associations with a lambda = 0.025
+adjacency_mat <- abs(adjacency_mat)
+# interdental sites
+adjacency_mat <- adjacency_mat[str_detect(rownames(adjacency_mat), "ohx\\d\\dla[dspc]"),
+                               str_detect(colnames(adjacency_mat), "ohx\\d\\dla[dspc]")]
+network <- graph_from_adjacency_matrix(adjacency_mat, mode = "directed", 
+                                       weighted = TRUE, diag = FALSE)
+
+in_degree <- degree(network, mode = "in")
+out_degree <- degree(network, mode = "out")
+total_degree <- degree(network, mode = "total")
+degree_df <- data.frame(
+  node = V(network)$name,
+  in_degree = in_degree,
+  out_degree = out_degree,
+  total_degree = total_degree
+)
+
+# centrality
+betweenness_cent <- betweenness(network, directed = TRUE, normalized = TRUE)
+closeness_in <- closeness(network, mode = "in", normalized = TRUE)
+closeness_out <- closeness(network, mode = "out", normalized = TRUE)
+eigenvector_cent <- eigen_centrality(network, directed = TRUE)$vector
+pagerank_cent <- page_rank(network)$vector
+hits_scores <- authority_score(network)
+authority_cent <- hits_scores$vector
+hub_cent <- hub_score(network)$vector
+centrality_df <- data.frame(
+  node = V(network)$name,
+  betweenness = betweenness_cent,
+  closeness_in = closeness_in,
+  closeness_out = closeness_out,
+  eigenvector = eigenvector_cent,
+  pagerank = pagerank_cent,
+  authority = authority_cent,
+  hub = hub_cent
+)
+
+# modularity Louvain algorithm
+louvain_modules <- cluster_louvain(as.undirected(network))
+modules_df <- data.frame(
+  node = V(network)$name,
+  louvain = membership(louvain_modules)
+)
+
+results_df <- merge(degree_df, centrality_df, by = "node")
+results_df <- merge(results_df, modules_df, by = "node")
+results_df <- results_df %>% 
+  mutate(tooth_no = str_extract(node, "\\d\\d"),
+         site  = str_extract(node, "la[dmspla]"))
+tooth_level_df <- results_df %>% group_by(tooth_no) %>%
+    summarise(
+        mean_out_degree = mean(out_degree), 
+        mean_in_degree = mean(in_degree), 
+        mean_betweenness = mean(betweenness),
+        mean_closeness_out = mean(closeness_out),
+        mean_eigenvector = mean(eigenvector),
+        # mean_pagerank = mean(pagerank),
+        # mean_authority = mean(authority),
+        # mean_hub = mean(hub),
+        .groups = 'drop'
+    )
+tooth_level_df %>% 
+  mutate(across(starts_with("mean_"), .fns = rank)) %>%
+  pivot_longer(
+    cols = -tooth_no,
+    names_to = "variable",
+    values_to = "value"
+  ) %>% ggplot(aes(x = tooth_no, y = variable, fill = value)) +
+  geom_tile(color = "white") +
+  scale_fill_gradient(low = "lightblue", high = "red") +
+  theme_minimal() +
+  labs(x = "Tooth Number", y = "Variable", fill = "Value") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+# the results are not very interpretable
+# it seems molars have higher degree and betweenness centrality, 
+#and incisors have higher eigenvector centrality
+# however, why two molars of 30 and 31 have so low degree centrality?
+# in addition, the centrality measurements seems not to be able to explain
+# why the optimal tooth combination
+```
+
+
+## Model Performance Evaluations
+
+### Internal Validation in NHAHES Test Dataset Based on Out-of-fold Predictions
+
+```{r, fig.width=4.5, fig.height=7}
+library(ggpubr) # wanted to change to cowplot and flextable. Gave up...
+metrics = c("Prevalence", "AUC", "Sensitivity", 
+            "Specificity", "F1-score", "Diagnostic Odds Ratio")
+format_metrics <- function(x) {
+  rounded <- round(x, 3)
+  ifelse(rounded == floor(rounded), 
+         sprintf("%.0f", rounded),  # whole numbers without decimals
+         sprintf("%.3f", rounded))  # 3 decimal places
+}
+set.seed(seed = 123456)
+
+train_data <- nhanes_complete %>%
+  mutate(across(.cols = starts_with("ohx"), 
+                .fns = \(x) case_match(x, "0"~0, "1"~1, "2"~2, "3"~3, 
+                                       "4"~4, "5"~5, "6/6+"~6))) %>%
+  select(seqn, starts_with("ohx"), MS) %>%
+  as.data.frame()
+tc <- c("03", "14", "18", "25", "30", "31")
+tc <- str_c(prefix,
+            rep(tc, each = length(suffix)),
+            rep(suffix, times = length(tc)))
+ramfjord_teeth <- str_c(prefix,
+                        rep(Ramfjord, each = length(suffix)),
+                        rep(suffix, times = length(Ramfjord)))
+half_mouth_teeth <- str_c(prefix,
+                          rep(half_mouth, each = length(suffix)),
+                          rep(suffix, times = length(half_mouth)))
+# deterministic classifiers: RF, SVM, penalized regression
+ML_competing_tbl <- 
+  prediction_models(training = train_data,
+                    test = NULL,
+                    using = tc,
+                    outcome = "MS", verbose = FALSE)
+# GenClassifier
+res <- readRDS(file = "../res/nhanes_6t_set1_rep0.rds")
+# simple PMEs
+Ramfjord_tbl <- 
+  prediction_models(training = train_data,
+                    test = NULL,
+                    using = ramfjord_teeth, method = "naive",
+                    outcome = "MS", verbose = FALSE)
+Half_tbl <- 
+  prediction_models(training = train_data,
+                    test = NULL,
+                    using = half_mouth_teeth, method = "naive",
+                    outcome = "MS", verbose = FALSE)
+
+pred_mat <- ML_competing_tbl$pred_mat
+pred_mat <- pred_mat %>%
+  as.data.frame() %>%
+  mutate(Perio6 = res$pred_MS,
+         HalfMouth = Half_tbl$pred_mat[, "naive"],
+         Ramfjord = Ramfjord_tbl$pred_mat[, "naive"]) %>%
+  rename(LASSO = "penalized", RF = "rf", SVM = "svm", Truth = "truth") %>%
+  select(Truth, Perio6, RF, SVM, LASSO, HalfMouth, Ramfjord)
+
+metrcs_mat <- matrix(NA, nrow = ncol(pred_mat), ncol = length(metrics) + 1,
+                     dimnames = list(names(pred_mat), c(metrics, "Threshold")))
+for(varr in colnames(pred_mat)){
+  if(varr %in% c("LASSO", "SVM", "RF", "Perio6"))
+    threshold  = "auto"
+  # if(varr == "Perio6") threshold = 0.20 # fixed it at 0.20
+  if(varr %in% c("HalfMouth", "Ramfjord", "Truth"))
+    threshold = NA_real_
+  metrcs_mat[varr, ] <- calculate_metrics2(truth = pred_mat$Truth, 
+                                           pred = pred_mat[[varr]],
+                                           threshold = threshold,
+                                           specificity_thre = 0.95)
+}
+
+
+rocobj <- roc(formula = Truth ~ Perio6 + RF + SVM + LASSO, 
+              data = pred_mat, quiet =TRUE)
+roc_figure_nhanes <- ggroc(rocobj)+ theme_bw() + 
+  annotate("point",
+           y = metrcs_mat["Ramfjord", "Sensitivity"],
+           x = metrcs_mat["Ramfjord", "Specificity"],
+           color = "grey40")+
+  annotate("text", label= "Ramfjord",
+           y = metrcs_mat["Ramfjord", "Sensitivity"],
+           x = metrcs_mat["Ramfjord", "Specificity"] - 0.15,
+           color = "grey40")+
+  annotate("point",
+           y = metrcs_mat["HalfMouth", "Sensitivity"],
+           x = metrcs_mat["HalfMouth", "Specificity"],
+           color = "black")+
+  annotate("text", label= "Half Mouth",
+           y = metrcs_mat["HalfMouth", "Sensitivity"],
+           x = metrcs_mat["HalfMouth", "Specificity"] - 0.15,
+           color = "black")+
+  annotate("text", label= "NHANES Complete",
+           y = 0.2,
+           x = 0.18,
+           color = "black")+
+  scale_color_brewer(palette = "Set1", direction = 1, name = "ML-PME Protocols")+
+  labs(x = "Specificity", y = "Sensitivity")+
+  scale_y_continuous(labels = scales::percent) +
+  scale_x_reverse(labels = scales::percent) + 
+  theme(legend.position = c(0.8, 0.2))
+temp_mat <- metrcs_mat[,c("Prevalence", "AUC", "Sensitivity", "Specificity")]
+rownames(temp_mat) <- 
+  if_else(rownames(temp_mat) == "GenClassifier", "Perio6", rownames(temp_mat))
+temp_mat <- apply(temp_mat, c(1,2), format_metrics)
+table_plot_nhanes <- ggtexttable(temp_mat, theme = ttheme("lBlack"))
+
+roc_figure_combined_nhanes <- ggarrange(roc_figure_nhanes, table_plot_nhanes, 
+                                        ncol = 1, nrow = 2,
+                                        heights = c(2, 1))
+roc_figure_combined_nhanes
+ggsave(filename = "../res/nhanes_performance.jpeg",
+       plot = roc_figure_combined_nhanes, width = 4.5, height = 7)
+ggsave(filename = "../res/nhanes_performance.pdf",
+       plot = roc_figure_combined_nhanes, width = 4.5, height = 7)
+
+```
+
+### External Validation in Temple U Dataset (Complete Cases)
+
+
+
+```{r, fig.width=4.5, fig.height=7}
+res <- read_csv("../Temple/res_output.csv")
+res <- arrange(res, seqn)
+pred_mat <- readRDS("../Temple/pred_mat.rds")
+stopifnot(pred_mat$Truth == res$truth_MS)
+pred_mat$Perio6 <- res$pred_MS
+
+metrcs_mat <- matrix(NA, nrow = ncol(pred_mat), ncol = length(metrics) + 1,
+                     dimnames = list(names(pred_mat), c(metrics, "Threshold")))
+for(varr in colnames(pred_mat)){
+  # threshold = case_match(varr, "LASSO"~0.42, "SVM" ~ 0.38, "RF"~0.40, 
+  #                        "Perio6" ~ 0.20, .default = NA_real_) # using NHANES values
+  if(varr %in% c("LASSO", "SVM", "RF", "Perio6"))
+    threshold  = "auto"
+  if(varr %in% c("HalfMouth", "Ramfjord", "Truth"))
+    threshold = NA_real_
+  metrcs_mat[varr, ] <- calculate_metrics2(truth = pred_mat$Truth,
+                                           pred = pred_mat[[varr]],
+                                           threshold = threshold,
+                                           specificity_thre = spec)
+}
+
+rocobj <- roc(formula = Truth ~ Perio6 + RF + SVM + LASSO, 
+              data = pred_mat, quiet =TRUE)
+roc_figure_temple <- ggroc(rocobj)+ theme_bw() + 
+  annotate("point",
+           y = metrcs_mat["Ramfjord", "Sensitivity"],
+           x = metrcs_mat["Ramfjord", "Specificity"],
+           color = "grey40")+
+  annotate("text", label= "Ramfjord",
+           y = metrcs_mat["Ramfjord", "Sensitivity"],
+           x = metrcs_mat["Ramfjord", "Specificity"] - 0.15,
+           color = "grey40")+
+  annotate("point",
+           y = metrcs_mat["HalfMouth", "Sensitivity"],
+           x = metrcs_mat["HalfMouth", "Specificity"],
+           color = "black")+
+  annotate("text", label= "Half Mouth",
+           y = metrcs_mat["HalfMouth", "Sensitivity"],
+           x = metrcs_mat["HalfMouth", "Specificity"] - 0.15,
+           color = "black")+
+  annotate("text", label= "Temple Complete",
+           y = 0.2,
+           x = 0.18,
+           color = "black")+
+  scale_color_brewer(palette = "Set1", direction = 1, name = "ML-PME Protocols")+
+  labs(x = "Specificity", y = "Sensitivity")+
+  scale_y_continuous(labels = scales::percent) +
+  scale_x_reverse(labels = scales::percent) + 
+  theme(legend.position = c(0.8, 0.2))
+temp_mat <- metrcs_mat[,c("Prevalence", "AUC", "Sensitivity", "Specificity")]
+rownames(temp_mat) <- 
+  if_else(rownames(temp_mat) == "GenClassifier", "Perio6", rownames(temp_mat))
+temp_mat <- apply(temp_mat, c(1,2), format_metrics)
+table_plot_temple <- ggtexttable(temp_mat, theme = ttheme("lBlack"))
+
+roc_figure_combined_temple <- ggarrange(roc_figure_temple, table_plot_temple, 
+                                        ncol = 1, nrow = 2,
+                                        heights = c(2, 1))
+roc_figure_combined_temple
+ggsave(filename = "../res/temple_performance.jpeg",
+       plot = roc_figure_combined_temple, width = 4.5, height = 7)
+ggsave(filename = "../res/temple_performance.pdf",
+       plot = roc_figure_combined_temple, width = 4.5, height = 7)
+```
+
+### External Validation in ARIC Dataset (Complete Cases)
+
+```{r, fig.width=4.5, fig.height=7}
+test_data <- aric_complete %>%
+  mutate(across(.cols = starts_with("ohx"), 
+                .fns = \(x) case_match(x, "0"~0, "1"~1, "2"~2, "3"~3, 
+                                       "4"~4, "5"~5, "6/6+"~6))) %>%
+  select(seqn, starts_with("ohx"), MS) %>%
+  as.data.frame()
+# deterministic classifiers: RF, SVM, penalized regression
+ML_competing_tbl <- 
+  prediction_models(training = train_data,
+                    test = test_data,
+                    using = tc,
+                    outcome = "MS", verbose = FALSE)
+# GenClassifier
+res <- readRDS(file = "../res/aric_6t_set1_rep0.rds")
+# simple PMEs
+Ramfjord_tbl <- 
+  prediction_models(training = test_data,
+                    test = NULL,
+                    using = ramfjord_teeth, method = "naive",
+                    outcome = "MS", verbose = FALSE)
+Half_tbl <- 
+  prediction_models(training = test_data,
+                    test = NULL,
+                    using = half_mouth_teeth, method = "naive",
+                    outcome = "MS", verbose = FALSE)
+
+pred_mat <- ML_competing_tbl$pred_mat
+pred_mat <- pred_mat %>%
+  as.data.frame() %>%
+  mutate(Perio6 = res$pred_MS,
+         HalfMouth = Half_tbl$pred_mat[, "naive"],
+         Ramfjord = Ramfjord_tbl$pred_mat[, "naive"]) %>%
+  rename(LASSO = "penalized", RF = "rf", SVM = "svm", Truth = "truth") %>%
+  select(Truth, Perio6, RF, SVM, LASSO, HalfMouth, Ramfjord)
+
+metrcs_mat <- matrix(NA, nrow = ncol(pred_mat), ncol = length(metrics) + 1,
+                     dimnames = list(names(pred_mat), c(metrics, "Threshold")))
+for(varr in colnames(pred_mat)){
+  # threshold = case_match(varr, "LASSO"~0.42, "SVM" ~ 0.38, "RF"~0.40, 
+  #                        "Perio6" ~ 0.20, .default = NA_real_) # using NHANES values
+  if(varr %in% c("LASSO", "SVM", "RF", "Perio6"))
+    threshold  = "auto"
+  if(varr %in% c("HalfMouth", "Ramfjord", "Truth"))
+    threshold = NA_real_
+  metrcs_mat[varr, ] <- calculate_metrics2(truth = pred_mat$Truth, 
+                                           pred = pred_mat[[varr]],
+                                           threshold = threshold,
+                                           specificity_thre = 0.95)
+}
+
+
+rocobj <- roc(formula = Truth ~ Perio6 + RF + SVM + LASSO, 
+              data = pred_mat, quiet =TRUE)
+roc_figure_aric <- ggroc(rocobj)+ theme_bw() + 
+  annotate("point",
+           y = metrcs_mat["Ramfjord", "Sensitivity"],
+           x = metrcs_mat["Ramfjord", "Specificity"],
+           color = "grey40")+
+  annotate("text", label= "Ramfjord",
+           y = metrcs_mat["Ramfjord", "Sensitivity"],
+           x = metrcs_mat["Ramfjord", "Specificity"] - 0.15,
+           color = "grey40")+
+  annotate("point",
+           y = metrcs_mat["HalfMouth", "Sensitivity"],
+           x = metrcs_mat["HalfMouth", "Specificity"],
+           color = "black")+
+  annotate("text", label= "Half Mouth",
+           y = metrcs_mat["HalfMouth", "Sensitivity"],
+           x = metrcs_mat["HalfMouth", "Specificity"] - 0.15,
+           color = "black")+
+  annotate("text", label= "ARIC Complete",
+           y = 0.2,
+           x = 0.18,
+           color = "black")+
+  scale_color_brewer(palette = "Set1", direction = 1, name = "ML-PME Protocols")+
+  labs(x = "Specificity", y = "Sensitivity")+
+  scale_y_continuous(labels = scales::percent) +
+  scale_x_reverse(labels = scales::percent) + 
+  theme(legend.position = c(0.8, 0.2))
+temp_mat <- metrcs_mat[,c("Prevalence", "AUC", "Sensitivity", "Specificity")]
+rownames(temp_mat) <- 
+  if_else(rownames(temp_mat) == "GenClassifier", "Perio6", rownames(temp_mat))
+temp_mat <- apply(temp_mat, c(1,2), format_metrics)
+table_plot_aric <- ggtexttable(temp_mat, theme = ttheme("lBlack"))
+
+roc_figure_combined_aric <- ggarrange(roc_figure_aric, table_plot_aric, 
+                                      ncol = 1, nrow = 2,
+                                      heights = c(2, 1))
+roc_figure_combined_aric
+ggsave(filename = "../res/aric_performance.jpeg",
+       plot = roc_figure_combined_aric, width = 4.5, height = 7)
+ggsave(filename = "../res/aric_performance.pdf",
+       plot = roc_figure_combined_aric, width = 4.5, height = 7)
+```
+
+### External Validation in ARIC Dataset (Robust performance when changing to different tooth combinations)
+
+```{r}
+test_data <- aric_complete %>%
+  mutate(across(.cols = starts_with("ohx"), 
+                .fns = \(x) case_match(x, "0"~0, "1"~1, "2"~2, "3"~3, 
+                                       "4"~4, "5"~5, "6/6+"~6))) %>%
+  select(seqn, starts_with("ohx"), MS) %>%
+  as.data.frame()
+scenarios <- c("Perio6 Default Teeth\n(03, 14, 18, 25, 30, 31)" = "aric_6t_set1_rep", 
+               "Alternative 6 Teeth\n(03, 15, 19, 25, 30, 31)" = "aric_6t_set2_rep",
+               "Alternative 5 Teeth\n(03, 14, 18, 25, 30)" = "aric_5t_set1_rep")
+alter_comb_df <- tibble(tc = character(),
+                        AUC = numeric(), AUC_sd = numeric(),
+                        Sensitivity = numeric(), Sensitivity_sd = numeric(),
+                        Specificity = numeric(), Specificity_sd = numeric())
+for(ss in 1:length(scenarios)){
+  cat("Current scenario:", names(scenarios)[ss], "\n")
+  aucs <- numeric(3)
+  sens <- numeric(3)
+  spec <- numeric(3)
+  for(rr in 1:3){
+    res <- readRDS(file = str_glue("../res/{scenarios[ss]}{rr-1}.rds"))
+    if(rr == 1) stopifnot(test_data$seqn == res$seqn)
+    metrcs_vec <- calculate_metrics2(truth = test_data$MS*1, 
+                                     pred = res$pred_MS*1,
+                                     threshold = "auto",
+                                     specificity_thre = 0.95)
+    aucs[rr] <- metrcs_vec["AUC"]
+    sens[rr] <- metrcs_vec["Sensitivity"]
+    spec[rr] <- metrcs_vec["Specificity"]
+  }
+  cat(str_glue("AUC: {round(mean(aucs),3)} ({round(sd(aucs),3)})"), "\n",
+      str_glue("Sensitivity: {round(mean(sens),3)} ({round(sd(sens),3)})"), "\n",
+      str_glue("Specificity: {round(mean(spec),3)} ({round(sd(spec),3)})"), "\n")
+  alter_comb_df_temp <- 
+    tibble(tc = names(scenarios)[ss], 
+           AUC = mean(aucs), AUC_sd = sd(aucs),
+           Sensitivity = mean(sens), Sensitivity_sd = sd(sens),
+           Specificity = mean(spec), Specificity_sd = sd(spec))
+  alter_comb_df <- bind_rows(alter_comb_df, alter_comb_df_temp)
+}
+alter_comb_fig <- alter_comb_df %>% 
+  pivot_longer(cols = c(AUC, Sensitivity, Specificity),
+               values_to = "value",names_to = "metric") %>%
+  mutate(tc = factor(tc, levels = names(scenarios))) %>%
+  mutate(sd = case_match(metric, "AUC" ~ AUC_sd, 
+                         "Sensitivity" ~ Sensitivity_sd,
+                         "Specificity" ~ Specificity_sd)) %>%
+  ggplot(aes(x=metric, fill = tc, y = value)) + 
+  geom_bar(stat = "identity", position = position_dodge(width = 0.9))+
+  geom_errorbar(aes(ymin = value - sd, ymax = value+sd), color = "grey20",
+                position = position_dodge(width = 0.9), width = 0.25) + 
+  labs(x = "Metrics", fill = "Tooth Combinations") +
+  theme_bw() + 
+  theme(axis.title.y = element_blank(),
+        legend.key.spacing.y = unit(3, "point")) +
+  scale_fill_brewer(palette = "Set1")
+alter_comb_fig
+ggsave(filename = "../res/alternative_performance.jpeg",
+       plot = alter_comb_fig, width = 5, height = 3)
+ggsave(filename = "../res/alternative_performance.pdf",
+       plot = alter_comb_fig, width = 5, height = 3)
+  
+```
+
+
+### External Validation in ARIC Dataset (Allowing missing data and missing teeth)
+
+```{r, fig.width=4.5, fig.height=7}
+test_data <- readRDS("../res/aric_extended.rds") %>%
+  mutate(across(.cols = starts_with("ohx"), 
+                .fns = \(x) case_match(x, "0"~0, "1"~1, "2"~2, "3"~3, 
+                                       "4"~4, "5"~5, "6/6+"~6))) %>%
+  select(seqn, starts_with("ohx"), MS) %>%
+  as.data.frame()
+# GenClassifier
+res <- readRDS(file = "../res/aric_e.rds")
+seqn_no <- readRDS(file = "../res/aric_e_seqn_no.rds")
+seqn_no_len <- unlist(lapply(seqn_no, FUN = length))
+seqn_no_len <- data.frame(subjects = seqn_no_len, 
+                          solutions = names(seqn_no_len),
+                          nteeth = nchar(names(seqn_no_len))/2,
+                          order = 1:length(seqn_no_len))
+recover_fig <- seqn_no_len %>% 
+  mutate(cumsum = cumsum(subjects), group = 1) %>%
+  ggplot(aes(x = fct_inorder(solutions), y = cumsum, group = group)) +
+  geom_step() + 
+  geom_hline(yintercept = nrow(test_data), col = "grey40", linetype = "dashed") +
+  geom_segment(x= 1, xend = 20, y=1700, yend=1700, color = "firebrick3")+
+  geom_segment(x= 21, xend = 40, y=1700, yend=1700, color = "dodgerblue3")+
+  geom_segment(x= 41, xend = 60, y=1700, yend=1700, color = "green4")+
+  annotate("text", x = 30, y = nrow(test_data) - 100, label = "Total", color = "grey20") +
+  annotate("text", x = 10, y = 1600, label = "Six-tooth", color = "firebrick3") +
+  annotate("text", x = 30, y = 1600, label = "Five-tooth", color = "dodgerblue3") +
+  annotate("text", x = 50, y = 1600, label = "Four-tooh", color = "green4") +
+  theme_bw() + labs(x = "Tooth Combination", y = "Accumulated Subjects") +
+  ylim(0, 4000)+
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1),
+        axis.ticks.x = element_blank(),
+        panel.grid.minor.x = element_blank(),
+        panel.grid.major.x = element_blank())
+recover_fig
+ggsave(plot = recover_fig, filename = "../res/included_aric_e.jpeg",
+       width = 6, height = 6)
+ggsave(plot = recover_fig, filename = "../res/included_aric_e.pdf",
+       width = 6, height = 6)
+
+test_data <- test_data %>%
+  filter(seqn %in% unlist(seqn_no))
+stopifnot(nrow(test_data) == nrow(res))
+test_data <- test_data[match(res$seqn, 
+                             test_data[["seqn"]]),]
+stopifnot(nrow(test_data) == nrow(res))
+stopifnot(res$seqn == test_data$seqn)
+
+# simple PMEs
+using = ramfjord_teeth
+n_teeth <- length(unique(str_extract(using,"\\d\\d")))
+temp_d <- test_data[, using]
+temp_d$"seqn" <- 1:nrow(temp_d)
+d <- case_def(temp_d, n_teeth_total = n_teeth) %>%
+  mutate(MS = (mod_12|sev_12))
+Ramfjord_pred <- as.numeric(d[["MS"]])
+
+using = half_mouth_teeth
+n_teeth <- length(unique(str_extract(using,"\\d\\d")))
+temp_d <- test_data[, using]
+temp_d$"seqn" <- 1:nrow(temp_d)
+d <- case_def(temp_d, n_teeth_total = n_teeth) %>%
+  mutate(MS = (mod_12|sev_12))
+HalfMouth_pred <- as.numeric(d[["MS"]])
+
+
+pred_mat <- res %>%
+  as.data.frame() %>%
+  mutate(Truth = test_data$MS * 1,
+         Perio6 = pred_MS) %>%
+  mutate(HalfMouth = HalfMouth_pred,
+         Ramfjord = Ramfjord_pred) %>%
+  select(Truth, Perio6, HalfMouth, Ramfjord)
+
+metrcs_mat <- matrix(NA, nrow = ncol(pred_mat), ncol = length(metrics) + 1,
+                     dimnames = list(names(pred_mat), c(metrics, "Threshold")))
+for(varr in colnames(pred_mat)){
+  if(varr %in% c("LASSO", "SVM", "RF", "Perio6"))
+    threshold  = "auto"
+  if(varr %in% c("HalfMouth", "Ramfjord", "Truth"))
+    threshold = NA_real_
+  # threshold = case_match(varr, "LASSO"~0.42, "SVM" ~ 0.38, "RF"~0.40, 
+  #                        "Perio6" ~ 0.20, .default = NA_real_) # using NHANES values
+  metrcs_mat[varr, ] <- calculate_metrics2(truth = pred_mat$Truth, 
+                                           pred = pred_mat[[varr]],
+                                           threshold = threshold,
+                                           specificity_thre = 0.95)
+}
+
+
+rocobj <- roc(formula = Truth ~ Perio6, 
+              data = pred_mat, quiet =TRUE)
+roc_figure_arice <- ggroc(rocobj, colour = "#e41a1c")+ theme_bw() + 
+  annotate("point",
+           y = metrcs_mat["Ramfjord", "Sensitivity"],
+           x = metrcs_mat["Ramfjord", "Specificity"],
+           color = "grey40")+
+  annotate("text", label= "Ramfjord",
+           y = metrcs_mat["Ramfjord", "Sensitivity"],
+           x = metrcs_mat["Ramfjord", "Specificity"] - 0.15,
+           color = "grey40")+
+  annotate("point",
+           y = metrcs_mat["HalfMouth", "Sensitivity"],
+           x = metrcs_mat["HalfMouth", "Specificity"],
+           color = "black")+
+  annotate("text", label= "Half Mouth",
+           y = metrcs_mat["HalfMouth", "Sensitivity"],
+           x = metrcs_mat["HalfMouth", "Specificity"] - 0.15,
+           color = "black")+
+  annotate("text", label= "ARIC Extended",
+           y = 0.2,
+           x = 0.18,
+           color = "black")+
+  # scale_color_brewer(palette = "Set1", direction = 1, name = "ML-PME Protocols")+
+  labs(x = "Specificity", y = "Sensitivity")+
+  scale_y_continuous(labels = scales::percent) +
+  scale_x_reverse(labels = scales::percent) + 
+  theme(legend.position = c(0.8, 0.2))
+temp_mat <- metrcs_mat[,c("Prevalence", "AUC", "Sensitivity", "Specificity")]
+rownames(temp_mat) <- 
+  if_else(rownames(temp_mat) == "GenClassifier", "Perio6", rownames(temp_mat))
+temp_mat <- apply(temp_mat, c(1,2), format_metrics)
+table_plot_arice <- ggtexttable(temp_mat, theme = ttheme("lBlack"))
+
+roc_figure_combined_arice <- ggarrange(roc_figure_arice, table_plot_arice, 
+                                       ncol = 1, nrow = 2,
+                                       heights = c(2, 1))
+roc_figure_combined_arice
+ggsave(filename = "../res/aric_e_performance.jpeg",
+       plot = roc_figure_combined_arice, width = 4.5, height = 7)
+ggsave(filename = "../res/aric_e_performance.pdf",
+       plot = roc_figure_combined_arice, width = 4.5, height = 7)
+```
+
+
+### Combined figure for model performance comparison
+
+```{r}
+performance_combined <- 
+  ggarrange(
+    ggarrange(
+      roc_figure_nhanes+theme(plot.margin = unit(c(10, 0, 0, 0), "points")), 
+      roc_figure_temple+theme(plot.margin = unit(c(10, 0, 0, 0), "points")), 
+      roc_figure_aric+theme(plot.margin = unit(c(10, 0, 0, 0), "points")), 
+      roc_figure_arice+theme(plot.margin = unit(c(10, 0, 0, 0), "points")),
+      ncol = 4, nrow = 1, common.legend = TRUE, legend = "bottom",
+      labels = c("(a)", "(c)", "(e)", "(g)")),
+    ggarrange(table_plot_nhanes, table_plot_temple, table_plot_aric, table_plot_arice,
+              ncol = 4, nrow = 1, 
+              labels = c("(b)", "(d)", "(f)", "(h)")),
+    nrow = 2, ncol=1, heights = c(2, 1)
+  )
+performance_combined
+ggsave(filename = "../res/performance_combined.jpeg",
+       plot = performance_combined, width = 17, height = 7)
+ggsave(filename = "../res/performance_combined.pdf",
+       plot = performance_combined, width = 17, height = 7)
+```
+
+## Model Application
+
+```{r}
+nhanes_complete_assoc <- nhanes_complete
+threshold = 0.20
+train_data <- nhanes_complete %>%
+  mutate(across(.cols = starts_with("ohx"), 
+                .fns = \(x) case_match(x, "0"~0, "1"~1, "2"~2, "3"~3, 
+                                       "4"~4, "5"~5, "6/6+"~6))) %>%
+  select(seqn, starts_with("ohx"), MS) %>%
+  as.data.frame()
+tc <- c("03", "14", "18", "25", "30", "31")
+tc <- str_c(prefix,
+            rep(tc, each = length(suffix)),
+            rep(suffix, times = length(tc)))
+ramfjord_teeth <- str_c(prefix,
+                        rep(Ramfjord, each = length(suffix)),
+                        rep(suffix, times = length(Ramfjord)))
+half_mouth_teeth <- str_c(prefix,
+                          rep(half_mouth, each = length(suffix)),
+                          rep(suffix, times = length(half_mouth)))
+# GenClassifier
+res <- readRDS(file = "../res/nhanes_6t_set1_rep0.rds")
+# simple PMEs
+Ramfjord_tbl <- 
+  prediction_models(training = train_data,
+                    test = NULL,
+                    using = ramfjord_teeth, method = "naive",
+                    outcome = "MS", verbose = FALSE)
+Half_tbl <- 
+  prediction_models(training = train_data,
+                    test = NULL,
+                    using = half_mouth_teeth, method = "naive",
+                    outcome = "MS", verbose = FALSE)
+
+nhanes_complete_assoc <- nhanes_complete_assoc %>%
+  mutate(gold = MS *1,
+         perio6 = (res$pred_MS >= threshold) *1,
+         halfmouth = Half_tbl$pred_mat[, "naive"],
+         ramfjord = Ramfjord_tbl$pred_mat[, "naive"])
+
+model0 <- glm(gold ~ age + sex + race + smk_stt, 
+              data = nhanes_complete_assoc, family = binomial())
+model1 <- glm(perio6 ~ age + sex + race + smk_stt, 
+              data = nhanes_complete_assoc, family = binomial())
+model2 <- glm(halfmouth ~ age + sex + race + smk_stt, 
+              data = nhanes_complete_assoc, family = binomial())
+model3 <- glm(ramfjord ~ age + sex + race + smk_stt, 
+              data = nhanes_complete_assoc, family = binomial())
+extract_results <- function(model, outcome_name) {
+  data.frame(
+    variable = c("Age (per year)", "Sex (Male)", "Race (Hispanic)", 
+                 "Race (Other)", "Race (White)", "Smoking"),
+    OR = exp(coef(model)[-1]),
+    lower = exp(confint(model)[-1, 1]),
+    upper = exp(confint(model)[-1, 2]),
+    pvalue = summary(model)$coefficients[-1, 4],
+    outcome = outcome_name
+  )
+}
+results <- rbind(
+  extract_results(model0, "Gold"),
+  extract_results(model1, "Perio6"),
+  extract_results(model2, "HalfMouth"),
+  extract_results(model3, "Ramfjord")
+)
+results$sig <- ifelse(results$pvalue < 0.05, "*", "")
+
+# forest plot
+forest_plot <- results %>% 
+  mutate(outcome = factor(outcome, levels = c("Gold", "Perio6", "HalfMouth", "Ramfjord"))) %>%
+  ggplot(aes(x = OR, y = reorder(variable, OR), color = outcome)) +
+  geom_vline(xintercept = 1, linetype = "dashed", color = "gray50", linewidth = 0.8) +
+  geom_errorbarh(aes(xmin = lower, xmax = upper), height = 0.2, linewidth = 0.8,
+                 position = position_dodge(width = 0.7)) +
+  geom_point(position = position_dodge(width = 0.7)) +
+  scale_x_log10(breaks = c(0.5, 1, 2, 3, 4)) +
+  labs(x = "Odds Ratio (log scale)",
+       y = NULL) +
+  scale_color_brewer(palette = "Set1", name = "Method") +
+  theme_bw() +
+  theme(panel.grid.major.y = element_blank(), 
+        panel.grid.minor = element_blank())
+
+forest_plot
+ggsave(filename = "../res/nhanes_forest_plot.jpeg",
+       plot = forest_plot, width = 5, height = 3)
+ggsave(filename = "../res/nhanes_forest_plot.pdf",
+       plot = forest_plot, width = 5, height = 3)
+
+
+```
+
+
+
